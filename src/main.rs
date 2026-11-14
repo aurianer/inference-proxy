@@ -1,0 +1,59 @@
+mod config;
+mod proxy;
+mod upstream;
+
+use std::net::TcpListener;
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+
+const LISTEN_HOST: &str = "127.0.0.1";
+const MAX_CLIENTS: usize = 32;
+
+fn main() -> ExitCode {
+    let args = match config::parse_args(std::env::args().skip(1)) {
+        Ok(args) => args,
+        Err(e) => return fail(2, &e),
+    };
+    let secrets = match config::read_secrets(std::io::stdin().lock()) {
+        Ok(secrets) => secrets,
+        Err(e) => return fail(2, &e),
+    };
+    let connector = match upstream::Connector::new() {
+        Ok(connector) => connector,
+        Err(e) => return fail(1, &e),
+    };
+    let listener = match TcpListener::bind((LISTEN_HOST, args.port)) {
+        Ok(listener) => listener,
+        Err(e) => return fail(1, &format!("cannot listen on {LISTEN_HOST}:{}: {e}", args.port)),
+    };
+    proxy::log(&format!(
+        "listening on {LISTEN_HOST}:{} -> https://{}{}",
+        args.port,
+        args.upstream.host_header(),
+        args.upstream.base_path
+    ));
+
+    let proxy = Arc::new(proxy::Proxy::new(secrets, args.auth, args.upstream, connector));
+    let active = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        if active.fetch_add(1, Ordering::SeqCst) >= MAX_CLIENTS {
+            active.fetch_sub(1, Ordering::SeqCst);
+            let _ = proxy::reply(&mut stream, 503, "too many concurrent requests");
+            continue;
+        }
+        let (proxy, active) = (Arc::clone(&proxy), Arc::clone(&active));
+        thread::spawn(move || {
+            proxy.handle(stream);
+            active.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+    ExitCode::SUCCESS
+}
+
+fn fail(code: u8, message: &str) -> ExitCode {
+    proxy::log(&format!("error: {message}"));
+    ExitCode::from(code)
+}

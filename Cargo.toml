@@ -1,0 +1,16 @@
+[package]
+name = "inference-proxy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.100"
+description = "Loopback proxy that injects an inference-service token for a sandboxed client"
+publish = false
+
+[dependencies]
+httparse = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+zeroize = "1"
+
+[profile.release]
+strip = true

@@ -1,0 +1,285 @@
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+
+use zeroize::Zeroizing;
+
+use crate::config::{Auth, Secrets, Upstream};
+use crate::upstream::Connector;
+
+const MAX_HEAD: usize = 64 * 1024;
+const MAX_HEADERS: usize = 64;
+const MAX_BODY: usize = 32 * 1024 * 1024;
+const BUFSIZE: usize = 64 * 1024;
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
+const ALLOWED_PREFIX: &str = "/v1/";
+const STRIPPED: [&str; 12] = [
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
+    "transfer-encoding", "upgrade", "host", "authorization", "x-api-key", "content-length",
+];
+
+pub struct Reject {
+    status: u16,
+    message: &'static str,
+}
+
+const fn reject(status: u16, message: &'static str) -> Reject {
+    Reject { status, message }
+}
+
+pub struct Proxy {
+    key: Zeroizing<String>,
+    auth_line: Zeroizing<String>,
+    upstream: Upstream,
+    connector: Connector,
+}
+
+impl Proxy {
+    pub fn new(secrets: Secrets, auth: Auth, upstream: Upstream, connector: Connector) -> Self {
+        let name = match auth {
+            Auth::Bearer => "Authorization: Bearer ",
+            Auth::XApiKey => "x-api-key: ",
+        };
+        let mut auth_line = Zeroizing::new(String::with_capacity(name.len() + secrets.token.len() + 2));
+        auth_line.push_str(name);
+        auth_line.push_str(&secrets.token);
+        auth_line.push_str("\r\n");
+        Self { key: secrets.key, auth_line, upstream, connector }
+    }
+
+    pub fn handle(&self, mut client: TcpStream) {
+        let _ = client.set_read_timeout(Some(CLIENT_TIMEOUT));
+        let _ = client.set_write_timeout(Some(CLIENT_TIMEOUT));
+        match self.serve(&mut client) {
+            Ok(line) => log(&line),
+            Err(r) => {
+                log(&format!("rejected {} {}", r.status, r.message));
+                let _ = reply(&mut client, r.status, r.message);
+            }
+        }
+    }
+
+    fn serve(&self, client: &mut TcpStream) -> Result<String, Reject> {
+        let (mut buf, head_len) = read_head(client)?;
+        let (request, body_len, label) = self.build_request(&buf[..head_len])?;
+
+        let mut body = Zeroizing::new(buf.split_off(head_len));
+        if body.len() > body_len {
+            return Err(reject(400, "more data than Content-Length"));
+        }
+        let missing = body_len - body.len();
+        body.resize(body_len, 0);
+        client
+            .read_exact(&mut body[body_len - missing..])
+            .map_err(|_| reject(400, "incomplete body"))?;
+
+        let mut upstream = self
+            .connector
+            .connect(&self.upstream.host, self.upstream.port)
+            .map_err(upstream_error)?;
+        upstream
+            .write_all(&request)
+            .and_then(|_| upstream.write_all(&body))
+            .and_then(|_| upstream.flush())
+            .map_err(upstream_error)?;
+
+        let (status, bytes) = relay(&mut upstream, client);
+        Ok(format!("{label} -> {status} ({bytes} bytes)"))
+    }
+
+    /// Validates the client request and returns the upstream request head, body length and a
+    /// log label. Runs every check before anything is sent upstream.
+    fn build_request(&self, head: &[u8]) -> Result<(Zeroizing<Vec<u8>>, usize, String), Reject> {
+        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        let mut req = httparse::Request::new(&mut headers);
+        match req.parse(head) {
+            Ok(httparse::Status::Complete(_)) => {}
+            _ => return Err(reject(400, "malformed request")),
+        }
+        let method = req.method.unwrap_or("");
+        let target = req.path.unwrap_or("");
+        if method != "GET" && method != "POST" {
+            return Err(reject(405, "method not allowed"));
+        }
+        if !is_path_allowed(target) {
+            return Err(reject(403, "path not allowed"));
+        }
+        if !ct_eq(presented_key(req.headers), self.key.as_bytes()) {
+            return Err(reject(401, "invalid local key"));
+        }
+        if has_header(req.headers, "transfer-encoding") {
+            return Err(reject(411, "chunked request bodies are not supported"));
+        }
+        if has_header(req.headers, "expect") {
+            return Err(reject(417, "Expect is not supported"));
+        }
+        let body_len = content_length(req.headers)?;
+
+        let mut out = Zeroizing::new(Vec::with_capacity(head.len() + self.auth_line.len() + 512));
+        let start = format!(
+            "{method} {}{target} HTTP/1.1\r\nHost: {}\r\n",
+            self.upstream.base_path,
+            self.upstream.host_header()
+        );
+        out.extend_from_slice(start.as_bytes());
+        for h in req.headers.iter() {
+            if !STRIPPED.iter().any(|s| h.name.eq_ignore_ascii_case(s)) {
+                out.extend_from_slice(h.name.as_bytes());
+                out.extend_from_slice(b": ");
+                out.extend_from_slice(h.value);
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        out.extend_from_slice(self.auth_line.as_bytes());
+        out.extend_from_slice(format!("Content-Length: {body_len}\r\nConnection: close\r\n\r\n").as_bytes());
+
+        let label = format!("{method} {}", target.split('?').next().unwrap_or(""));
+        Ok((out, body_len, label))
+    }
+}
+
+fn upstream_error(e: io::Error) -> Reject {
+    log(&format!("upstream error: {e}"));
+    reject(502, "upstream unreachable")
+}
+
+/// Origin-form path under /v1/, without dot segments or encodings upstream could normalise.
+pub fn is_path_allowed(target: &str) -> bool {
+    if !target.starts_with(ALLOWED_PREFIX) {
+        return false;
+    }
+    let path = target.split('?').next().unwrap_or("");
+    !path.contains(['%', '\\']) && !path.split('/').any(|seg| seg == "." || seg == "..")
+}
+
+/// Constant-time comparison for equal lengths; the key length is not secret.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn presented_key<'a>(headers: &[httparse::Header<'a>]) -> &'a [u8] {
+    if let Some(h) = headers.iter().find(|h| h.name.eq_ignore_ascii_case("x-api-key")) {
+        return h.value;
+    }
+    headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("authorization"))
+        .and_then(|h| h.value.strip_prefix(b"Bearer "))
+        .unwrap_or(b"")
+}
+
+fn has_header(headers: &[httparse::Header], name: &str) -> bool {
+    headers.iter().any(|h| h.name.eq_ignore_ascii_case(name))
+}
+
+fn content_length(headers: &[httparse::Header]) -> Result<usize, Reject> {
+    let mut length = None;
+    for h in headers.iter().filter(|h| h.name.eq_ignore_ascii_case("content-length")) {
+        let parsed = std::str::from_utf8(h.value)
+            .ok()
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|v| v.parse::<usize>().ok())
+            .ok_or(reject(400, "invalid Content-Length"))?;
+        if length.is_some_and(|l| l != parsed) {
+            return Err(reject(400, "conflicting Content-Length"));
+        }
+        length = Some(parsed);
+    }
+    let length = length.unwrap_or(0);
+    if length > MAX_BODY {
+        return Err(reject(413, "body too large"));
+    }
+    Ok(length)
+}
+
+/// Reads until the end of the request head; returns the buffer and the head length.
+fn read_head(client: &mut TcpStream) -> Result<(Vec<u8>, usize), Reject> {
+    let mut buf = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = client.read(&mut chunk).map_err(|_| reject(408, "request timeout"))?;
+        if n == 0 {
+            return Err(reject(400, "connection closed before request head"));
+        }
+        let search_from = buf.len().saturating_sub(3);
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf[search_from..].windows(4).position(|w| w == b"\r\n\r\n") {
+            return Ok((buf, search_from + pos + 4));
+        }
+        if buf.len() > MAX_HEAD {
+            return Err(reject(431, "request head too large"));
+        }
+    }
+}
+
+/// Copies the upstream response to the client until the upstream closes. Returns the status
+/// code parsed from the first bytes, for logging only, and the number of bytes relayed.
+fn relay(upstream: &mut impl Read, client: &mut impl Write) -> (String, usize) {
+    let mut buf = vec![0u8; BUFSIZE];
+    let (mut status, mut total) = (String::from("?"), 0usize);
+    loop {
+        let n = match upstream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(_) => break,
+        };
+        if total == 0 && n >= 12 && buf.starts_with(b"HTTP/1.") {
+            status = String::from_utf8_lossy(&buf[9..12]).into_owned();
+        }
+        if client.write_all(&buf[..n]).and_then(|_| client.flush()).is_err() {
+            break;
+        }
+        total += n;
+    }
+    (status, total)
+}
+
+pub fn reply(stream: &mut impl Write, status: u16, message: &str) -> io::Result<()> {
+    let reason = match status {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        417 => "Expectation Failed",
+        431 => "Request Header Fields Too Large",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    let body = format!("{message}\n");
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )?;
+    stream.flush()
+}
+
+pub fn log(message: &str) {
+    eprintln!("{message}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths() {
+        assert!(is_path_allowed("/v1/messages?beta=true"));
+        for p in ["/admin", "/v1", "/v1/../x", "/v1/./x", "/v1/%2e%2e/x", "http://e/v1/x", "/v1\\x"] {
+            assert!(!is_path_allowed(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn constant_time_eq() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"abcd"));
+    }
+}

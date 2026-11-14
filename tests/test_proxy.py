@@ -163,8 +163,10 @@ class ProxyTest(unittest.TestCase):
                "X-Hidden: 1\r\n\r\n").encode()
         with socket.create_connection(("127.0.0.1", self.bearer[1]), timeout=10) as sock:
             sock.sendall(raw)
-            status = sock.recv(64).split(b" ")[1]
-        self.assertEqual(status, b"400")
+            reply = b""
+            while chunk := sock.recv(4096):
+                reply += chunk
+        self.assertEqual(reply.split(b" ")[1], b"400")
         self.assertEqual(Upstream.seen, [])
 
     def test_process_memory_not_readable_by_same_user(self):

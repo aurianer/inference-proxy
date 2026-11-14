@@ -1,3 +1,11 @@
+<!--
+    Copyright (c) 2026 ETH Zurich
+
+    SPDX-License-Identifier: BSL-1.0
+    Distributed under the Boost Software License, Version 1.0. (See accompanying
+    file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+-->
+
 # inference-proxy
 
 A loopback HTTP proxy that injects an inference-service token, so a sandboxed AI coding agent
@@ -142,3 +150,8 @@ connections.
   client can make the proxy use about 1 GiB.
 - Wiping memory is best effort: the token is copied into each outgoing request buffer, which is
   wiped after use, but the kernel and TLS library may hold transient copies.
+
+## License
+
+Distributed under the Boost Software License, Version 1.0. See
+[LICENSE_1_0.txt](LICENSE_1_0.txt).

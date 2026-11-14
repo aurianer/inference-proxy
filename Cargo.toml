@@ -1,9 +1,16 @@
+#  Copyright (c) 2026 ETH Zurich
+#
+#  SPDX-License-Identifier: BSL-1.0
+#  Distributed under the Boost Software License, Version 1.0. (See accompanying
+#  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+
 [package]
 name = "inference-proxy"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.100"
 description = "Loopback proxy that injects an inference-service token for a sandboxed client"
+license = "BSL-1.0"
 publish = false
 
 [dependencies]

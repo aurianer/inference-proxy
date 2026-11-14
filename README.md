@@ -33,6 +33,8 @@ one host.
 - Relays the response byte for byte (`Connection: close` on both sides), so streaming responses
   (server-sent events) work without the proxy parsing them.
 - Logs one line per request (method, path, status) to stderr. Never logs headers or bodies.
+- Exits when its parent process dies (`PR_SET_PDEATHSIG`), so a launcher that is killed
+  without running its cleanup cannot leave a proxy behind that still holds the token.
 - Marks itself non-dumpable at startup: a crash writes no core dump (which would contain the
   token), and other processes of the same user cannot read its memory.
 
@@ -126,7 +128,7 @@ must not be able to replace the program that receives the token.
 | `rustls-native-certs` | Trust the system CA store (honours `SSL_CERT_FILE`) |
 | `httparse` | Strict HTTP/1.x request parsing, no dependencies |
 | `zeroize` | Wipe the key and token from memory when dropped |
-| `libc` | One `prctl(PR_SET_DUMPABLE, 0)` call at startup |
+| `libc` | Two `prctl` calls at startup (`PR_SET_DUMPABLE`, `PR_SET_PDEATHSIG`) |
 
 No async runtime and no HTTP framework: one thread per connection, with a cap on concurrent
 connections.

@@ -10,6 +10,7 @@ import ssl
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -172,6 +173,22 @@ class ProxyTest(unittest.TestCase):
     def test_process_memory_not_readable_by_same_user(self):
         with self.assertRaises(PermissionError):
             open(f"/proc/{self.bearer[0].pid}/mem", "rb").close()
+
+    def test_proxy_exits_when_its_parent_is_killed(self):
+        parent = subprocess.Popen(
+            ["bash", "-c", '"$0" --upstream https://localhost:1 <&0 & echo $!; wait', PROXY],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        parent.stdin.write(f"{KEY}\n{TOKEN}\n".encode())
+        parent.stdin.close()
+        proxy_pid = int(parent.stdout.readline())
+        self.assertTrue(parent.stdout.readline().startswith(b"port="))
+        parent.kill()
+        parent.wait(5)
+        parent.stdout.close()
+        deadline = time.monotonic() + 5
+        while os.path.exists(f"/proc/{proxy_pid}") and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(os.path.exists(f"/proc/{proxy_pid}"))
 
     def test_missing_token_exits(self):
         proc, port, line = self.start_proxy("bearer", stdin=f"{KEY}\n")

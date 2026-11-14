@@ -25,6 +25,9 @@ fn main() -> ExitCode {
     if let Err(e) = deny_memory_dumps() {
         return fail(1, &format!("cannot disable core dumps: {e}"));
     }
+    if let Err(e) = exit_with_parent() {
+        return fail(1, &format!("cannot tie the proxy to its parent process: {e}"));
+    }
     let args = match config::parse_args(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(e) => return fail(2, &e),
@@ -80,6 +83,16 @@ fn main() -> ExitCode {
 fn deny_memory_dumps() -> std::io::Result<()> {
     // SAFETY: prctl(PR_SET_DUMPABLE, 0) takes integer arguments only and touches no memory.
     if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Asks the kernel to terminate this process when its parent dies, so a launcher killed
+/// without running its cleanup cannot leave a proxy behind that still holds the token.
+fn exit_with_parent() -> std::io::Result<()> {
+    // SAFETY: prctl(PR_SET_PDEATHSIG, sig) takes integer arguments only and touches no memory.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())

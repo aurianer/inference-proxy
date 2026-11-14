@@ -12,6 +12,15 @@ use std::thread;
 const LISTEN_HOST: &str = "127.0.0.1";
 const MAX_CLIENTS: usize = 32;
 
+/// Frees its connection slot on drop, so a panicking handler cannot leak one.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn main() -> ExitCode {
     if let Err(e) = deny_memory_dumps() {
         return fail(1, &format!("cannot disable core dumps: {e}"));
@@ -52,15 +61,15 @@ fn main() -> ExitCode {
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
+        let slot = Slot(Arc::clone(&active));
         if active.fetch_add(1, Ordering::SeqCst) >= MAX_CLIENTS {
-            active.fetch_sub(1, Ordering::SeqCst);
             let _ = proxy::reply(&mut stream, 503, "too many concurrent requests");
             continue;
         }
-        let (proxy, active) = (Arc::clone(&proxy), Arc::clone(&active));
+        let proxy = Arc::clone(&proxy);
         thread::spawn(move || {
+            let _slot = slot;
             proxy.handle(stream);
-            active.fetch_sub(1, Ordering::SeqCst);
         });
     }
     ExitCode::SUCCESS

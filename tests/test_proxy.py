@@ -5,6 +5,7 @@ Run: PROXY_BIN=target/release/inference-proxy python3 -m unittest discover -s te
 
 import http.client
 import os
+import socket
 import ssl
 import subprocess
 import tempfile
@@ -139,10 +140,31 @@ class ProxyTest(unittest.TestCase):
 
     def test_paths_outside_v1_rejected(self):
         auth = {"Authorization": f"Bearer {KEY}"}
-        for path in ("/admin", "/v1/../admin", "/v1/%2e%2e/admin", "http://evil.example/v1/x"):
+        for path in ("/admin", "/v1/../admin", "/v1/%2e%2e/admin", "http://evil.example/v1/x",
+                     "/v1/..;/admin", "/v1//admin", "/v1/x;y"):
             with self.subTest(path=path):
                 resp, _ = self.request(self.bearer[1], path=path, headers=auth)
                 self.assertEqual(resp.status, 403)
+        self.assertEqual(Upstream.seen, [])
+
+    def test_only_allowlisted_headers_forwarded(self):
+        resp, _ = self.request(self.bearer[1], headers={
+            "Authorization": f"Bearer {KEY}", "X-Original-URL": "/admin",
+            "X-HTTP-Method-Override": "DELETE", "Cookie": "a=b", "X-Stainless-OS": "Linux"})
+        self.assertEqual(resp.status, 200)
+        _, headers, _ = Upstream.seen[0]
+        names = {k.lower() for k in headers}
+        self.assertIn("x-stainless-os", names)
+        self.assertFalse(names & {"x-original-url", "x-http-method-override", "cookie"})
+
+    def test_head_ending_parsers_could_disagree_on_rejected(self):
+        """A bare-LF blank line ends the head for some parsers; nothing may hide after it."""
+        raw = (f"POST /v1/messages HTTP/1.1\nAuthorization: Bearer {KEY}\n\n"
+               "X-Hidden: 1\r\n\r\n").encode()
+        with socket.create_connection(("127.0.0.1", self.bearer[1]), timeout=10) as sock:
+            sock.sendall(raw)
+            status = sock.recv(64).split(b" ")[1]
+        self.assertEqual(status, b"400")
         self.assertEqual(Upstream.seen, [])
 
     def test_process_memory_not_readable_by_same_user(self):

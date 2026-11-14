@@ -15,3 +15,4 @@ zeroize = "1"
 
 [profile.release]
 strip = true
+overflow-checks = true

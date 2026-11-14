@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use crate::config::{Auth, Secrets, Upstream};
+use crate::config::{is_clean_path, Auth, Secrets, Upstream};
 use crate::upstream::Connector;
 
 const MAX_HEAD: usize = 64 * 1024;
@@ -13,10 +13,12 @@ const MAX_BODY: usize = 32 * 1024 * 1024;
 const BUFSIZE: usize = 64 * 1024;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 const ALLOWED_PREFIX: &str = "/v1/";
-const STRIPPED: [&str; 12] = [
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
-    "transfer-encoding", "upgrade", "host", "authorization", "x-api-key", "content-length",
-];
+
+// Allowlist, not denylist: headers such as X-Original-URL or X-HTTP-Method-Override can make
+// some upstream stacks serve another path or method than the one validated here.
+const FORWARDED_HEADERS: [&str; 6] =
+    ["accept", "accept-encoding", "accept-language", "content-type", "user-agent", "x-app"];
+const FORWARDED_PREFIXES: [&str; 3] = ["anthropic-", "x-stainless-", "x-claude-code-"];
 
 pub struct Reject {
     status: u16,
@@ -25,6 +27,12 @@ pub struct Reject {
 
 const fn reject(status: u16, message: &'static str) -> Reject {
     Reject { status, message }
+}
+
+struct Forward {
+    head: Zeroizing<Vec<u8>>,
+    body_len: usize,
+    label: String,
 }
 
 pub struct Proxy {
@@ -61,16 +69,16 @@ impl Proxy {
 
     fn serve(&self, client: &mut TcpStream) -> Result<String, Reject> {
         let (mut buf, head_len) = read_head(client)?;
-        let (request, body_len, label) = self.build_request(&buf[..head_len])?;
+        let forward = self.build_request(&buf[..head_len])?;
 
         let mut body = Zeroizing::new(buf.split_off(head_len));
-        if body.len() > body_len {
+        if body.len() > forward.body_len {
             return Err(reject(400, "more data than Content-Length"));
         }
-        let missing = body_len - body.len();
-        body.resize(body_len, 0);
+        let received = body.len();
+        body.resize(forward.body_len, 0);
         client
-            .read_exact(&mut body[body_len - missing..])
+            .read_exact(&mut body[received..])
             .map_err(|_| reject(400, "incomplete body"))?;
 
         let mut upstream = self
@@ -78,22 +86,23 @@ impl Proxy {
             .connect(&self.upstream.host, self.upstream.port)
             .map_err(upstream_error)?;
         upstream
-            .write_all(&request)
+            .write_all(&forward.head)
             .and_then(|_| upstream.write_all(&body))
             .and_then(|_| upstream.flush())
             .map_err(upstream_error)?;
 
         let (status, bytes) = relay(&mut upstream, client);
-        Ok(format!("{label} -> {status} ({bytes} bytes)"))
+        Ok(format!("{} -> {status} ({bytes} bytes)", forward.label))
     }
 
-    /// Validates the client request and returns the upstream request head, body length and a
-    /// log label. Runs every check before anything is sent upstream.
-    fn build_request(&self, head: &[u8]) -> Result<(Zeroizing<Vec<u8>>, usize, String), Reject> {
+    /// Validates the client request and builds the upstream request head. Every check runs
+    /// before anything is sent upstream.
+    fn build_request(&self, head: &[u8]) -> Result<Forward, Reject> {
         let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
         let mut req = httparse::Request::new(&mut headers);
+        // The parser must agree on where the head ends, or bytes could hide between the two.
         match req.parse(head) {
-            Ok(httparse::Status::Complete(_)) => {}
+            Ok(httparse::Status::Complete(n)) if n == head.len() => {}
             _ => return Err(reject(400, "malformed request")),
         }
         let method = req.method.unwrap_or("");
@@ -115,26 +124,29 @@ impl Proxy {
         }
         let body_len = content_length(req.headers)?;
 
-        let mut out = Zeroizing::new(Vec::with_capacity(head.len() + self.auth_line.len() + 512));
-        let start = format!(
+        let mut plain = format!(
             "{method} {}{target} HTTP/1.1\r\nHost: {}\r\n",
             self.upstream.base_path,
             self.upstream.host_header()
-        );
-        out.extend_from_slice(start.as_bytes());
-        for h in req.headers.iter() {
-            if !STRIPPED.iter().any(|s| h.name.eq_ignore_ascii_case(s)) {
-                out.extend_from_slice(h.name.as_bytes());
-                out.extend_from_slice(b": ");
-                out.extend_from_slice(h.value);
-                out.extend_from_slice(b"\r\n");
-            }
+        )
+        .into_bytes();
+        for h in req.headers.iter().filter(|h| is_forwarded(h.name)) {
+            plain.extend_from_slice(h.name.as_bytes());
+            plain.extend_from_slice(b": ");
+            plain.extend_from_slice(h.value);
+            plain.extend_from_slice(b"\r\n");
         }
+        let tail = format!("Content-Length: {body_len}\r\nConnection: close\r\n\r\n");
+
+        // Exact capacity: the buffer holding the token never reallocates, so no copy of it is
+        // left behind unwiped.
+        let mut out = Zeroizing::new(Vec::with_capacity(plain.len() + self.auth_line.len() + tail.len()));
+        out.extend_from_slice(&plain);
         out.extend_from_slice(self.auth_line.as_bytes());
-        out.extend_from_slice(format!("Content-Length: {body_len}\r\nConnection: close\r\n\r\n").as_bytes());
+        out.extend_from_slice(tail.as_bytes());
 
         let label = format!("{method} {}", target.split('?').next().unwrap_or(""));
-        Ok((out, body_len, label))
+        Ok(Forward { head: out, body_len, label })
     }
 }
 
@@ -143,13 +155,16 @@ fn upstream_error(e: io::Error) -> Reject {
     reject(502, "upstream unreachable")
 }
 
-/// Origin-form path under /v1/, without dot segments or encodings upstream could normalise.
+/// Origin-form target whose path is clean (see is_clean_path) and under /v1/.
 pub fn is_path_allowed(target: &str) -> bool {
-    if !target.starts_with(ALLOWED_PREFIX) {
-        return false;
-    }
     let path = target.split('?').next().unwrap_or("");
-    !path.contains(['%', '\\']) && !path.split('/').any(|seg| seg == "." || seg == "..")
+    path.starts_with(ALLOWED_PREFIX) && is_clean_path(path)
+}
+
+fn is_forwarded(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    FORWARDED_HEADERS.contains(&name.as_str())
+        || FORWARDED_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 /// Constant-time comparison for equal lengths; the key length is not secret.
@@ -217,13 +232,11 @@ fn read_head(client: &mut TcpStream) -> Result<(Vec<u8>, usize), Reject> {
 fn relay(upstream: &mut impl Read, client: &mut impl Write) -> (String, usize) {
     let mut buf = vec![0u8; BUFSIZE];
     let (mut status, mut total) = (String::from("?"), 0usize);
-    loop {
-        let n = match upstream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(_) => break,
-        };
+    // A read error also ends the relay: rustls reports a close without close_notify that way.
+    while let Ok(n) = upstream.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
         if total == 0 && n >= 12 && buf.starts_with(b"HTTP/1.") {
             status = String::from_utf8_lossy(&buf[9..12]).into_owned();
         }
@@ -271,8 +284,25 @@ mod tests {
     #[test]
     fn paths() {
         assert!(is_path_allowed("/v1/messages?beta=true"));
-        for p in ["/admin", "/v1", "/v1/../x", "/v1/./x", "/v1/%2e%2e/x", "http://e/v1/x", "/v1\\x"] {
+        assert!(is_path_allowed("/v1/messages/count_tokens"));
+        for p in [
+            "/admin", "/v1", "/v1/", "/v1/../x", "/v1/./x", "/v1/%2e%2e/x", "http://e/v1/x",
+            "/v1\\x", "/v1//x", "/v1/..;/x", "/v1/x;y",
+        ] {
             assert!(!is_path_allowed(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn forwarded_headers() {
+        for h in ["Content-Type", "anthropic-version", "X-Stainless-OS", "user-agent"] {
+            assert!(is_forwarded(h), "{h}");
+        }
+        for h in [
+            "Host", "Authorization", "x-api-key", "Content-Length", "Connection", "Cookie",
+            "X-Original-URL", "X-HTTP-Method-Override", "X-Forwarded-Host",
+        ] {
+            assert!(!is_forwarded(h), "{h}");
         }
     }
 

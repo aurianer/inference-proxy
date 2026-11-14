@@ -77,6 +77,10 @@ pub fn parse_upstream(url: &str) -> Result<Upstream, String> {
         Some((h, p)) => (h, p.parse().map_err(|_| "--upstream has an invalid port")?),
         None => (authority, 443),
     };
+    let base_path = path.trim_end_matches('/');
+    if port == 0 || (!base_path.is_empty() && !is_clean_path(base_path)) {
+        return Err("--upstream has an invalid port or base path".into());
+    }
     let host_ok = !host.is_empty()
         && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
     if !host_ok {
@@ -85,7 +89,19 @@ pub fn parse_upstream(url: &str) -> Result<Upstream, String> {
     Ok(Upstream {
         host: host.to_ascii_lowercase(),
         port,
-        base_path: path.trim_end_matches('/').to_string(),
+        base_path: base_path.to_string(),
+    })
+}
+
+/// Absolute path of non-empty segments made of [A-Za-z0-9_.-], without "." or ".." segments.
+/// Leaves nothing (encodings, ";" parameters, "//") an upstream could normalise differently.
+pub fn is_clean_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else { return false };
+    rest.split('/').all(|seg| {
+        !seg.is_empty()
+            && seg != "."
+            && seg != ".."
+            && seg.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
     })
 }
 
@@ -139,8 +155,20 @@ mod tests {
             "https://",
             "https://[::1]",
             "https://a.ch:99999",
+            "https://a.ch:0",
+            "https://a.ch/a/../b",
+            "https://a.ch/a b",
         ] {
             assert!(parse_upstream(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn clean_paths() {
+        assert!(is_clean_path("/v1/messages"));
+        assert!(is_clean_path("/v1/models/glm-5.3"));
+        for p in ["", "v1", "/", "/v1/", "/v1//x", "/v1/./x", "/v1/../x", "/v1/..;/x", "/v1/%2e/x"] {
+            assert!(!is_clean_path(p), "{p}");
         }
     }
 

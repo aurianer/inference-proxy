@@ -5,7 +5,6 @@ Run: PROXY_BIN=target/release/inference-proxy python3 -m unittest discover -s te
 
 import http.client
 import os
-import socket
 import ssl
 import subprocess
 import tempfile
@@ -18,12 +17,6 @@ PROXY = os.environ.get("PROXY_BIN") or os.path.join(
 KEY = "k" * 40
 TOKEN = "real-upstream-token-123"
 SSE_CHUNKS = [b"event: a\ndata: 1\n\n", b"event: b\ndata: 2\n\n", b"event: c\ndata: 3\n\n"]
-
-
-def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 class Upstream(BaseHTTPRequestHandler):
@@ -74,26 +67,28 @@ class ProxyTest(unittest.TestCase):
 
     @classmethod
     def start_proxy(cls, auth, stdin=f"{KEY}\n{TOKEN}\n"):
-        port = free_port()
+        """Starts a proxy on a kernel-chosen port; returns (process, port or None, stderr line)."""
         proc = subprocess.Popen(
-            [PROXY, "--upstream", f"https://localhost:{cls.up_port}/gw",
-             "--port", str(port), "--auth", auth],
-            stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+            [PROXY, "--upstream", f"https://localhost:{cls.up_port}/gw", "--auth", auth],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env={**os.environ, "SSL_CERT_FILE": cls.cert})
         proc.stdin.write(stdin.encode())
         proc.stdin.close()
         line = proc.stderr.readline().decode()
-        if "listening" not in line:
+        reported = proc.stdout.readline().decode().strip()
+        if not reported.startswith("port="):
             proc.wait(5)
+            proc.stdout.close()
             proc.stderr.close()
             return proc, None, line
-        return proc, port, line
+        return proc, int(reported.removeprefix("port=")), line
 
     @classmethod
     def tearDownClass(cls):
         for proc, _, _ in (cls.bearer, cls.apikey):
             proc.terminate()
             proc.wait(5)
+            proc.stdout.close()
             proc.stderr.close()
         cls.upstream.shutdown()
         cls.upstream.server_close()

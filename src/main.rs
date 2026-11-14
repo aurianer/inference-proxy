@@ -2,6 +2,7 @@ mod config;
 mod proxy;
 mod upstream;
 
+use std::io::Write;
 use std::net::TcpListener;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,12 +29,21 @@ fn main() -> ExitCode {
         Ok(listener) => listener,
         Err(e) => return fail(1, &format!("cannot listen on {LISTEN_HOST}:{}: {e}", args.port)),
     };
+    let port = match listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(e) => return fail(1, &format!("cannot read the listening port: {e}")),
+    };
     proxy::log(&format!(
-        "listening on {LISTEN_HOST}:{} -> https://{}{}",
-        args.port,
+        "listening on {LISTEN_HOST}:{port} -> https://{}{}",
         args.upstream.host_header(),
         args.upstream.base_path
     ));
+    // The launcher reads the port from here, over a pipe only this process can write to.
+    let mut stdout = std::io::stdout().lock();
+    if writeln!(stdout, "port={port}").and_then(|_| stdout.flush()).is_err() {
+        return fail(1, "cannot report the listening port on stdout");
+    }
+    drop(stdout);
 
     let proxy = Arc::new(proxy::Proxy::new(secrets, args.auth, args.upstream, connector));
     let active = Arc::new(AtomicUsize::new(0));

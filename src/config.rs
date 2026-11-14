@@ -30,6 +30,7 @@ impl Upstream {
 
 pub struct Args {
     pub upstream: Upstream,
+    /// 0 lets the kernel pick a free port.
     pub port: u16,
     pub auth: Auth,
 }
@@ -45,7 +46,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--upstream" => upstream = Some(parse_upstream(&value)?),
-            "--port" => port = Some(value.parse().map_err(|_| "--port must be 1-65535")?),
+            "--port" => port = Some(value.parse().map_err(|_| "--port must be 0-65535")?),
             "--auth" => {
                 auth = match value.as_str() {
                     "bearer" => Auth::Bearer,
@@ -58,7 +59,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String
     }
     Ok(Args {
         upstream: upstream.ok_or("--upstream is required")?,
-        port: port.filter(|p| *p != 0).ok_or("--port is required (1-65535)")?,
+        port: port.unwrap_or(0),
         auth,
     })
 }

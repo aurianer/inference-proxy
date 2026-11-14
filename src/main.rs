@@ -13,6 +13,9 @@ const LISTEN_HOST: &str = "127.0.0.1";
 const MAX_CLIENTS: usize = 32;
 
 fn main() -> ExitCode {
+    if let Err(e) = deny_memory_dumps() {
+        return fail(1, &format!("cannot disable core dumps: {e}"));
+    }
     let args = match config::parse_args(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(e) => return fail(2, &e),
@@ -61,6 +64,16 @@ fn main() -> ExitCode {
         });
     }
     ExitCode::SUCCESS
+}
+
+/// Marks the process non-dumpable: no core dump (which a crash handler such as apport would
+/// write to disk, token included) and no ptrace or /proc/<pid>/mem access by the same user.
+fn deny_memory_dumps() -> std::io::Result<()> {
+    // SAFETY: prctl(PR_SET_DUMPABLE, 0) takes integer arguments only and touches no memory.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {

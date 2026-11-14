@@ -145,6 +145,10 @@ class ProxyTest(unittest.TestCase):
                 self.assertEqual(resp.status, 403)
         self.assertEqual(Upstream.seen, [])
 
+    def test_process_memory_not_readable_by_same_user(self):
+        with self.assertRaises(PermissionError):
+            open(f"/proc/{self.bearer[0].pid}/mem", "rb").close()
+
     def test_missing_token_exits(self):
         proc, port, line = self.start_proxy("bearer", stdin=f"{KEY}\n")
         self.assertIsNone(port)

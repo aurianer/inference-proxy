@@ -111,6 +111,9 @@ impl Proxy {
             return Err(reject(405, "method not allowed"));
         }
         if !is_path_allowed(target) {
+            // httparse only accepts visible ASCII in the target, so it cannot forge log lines.
+            let path: String = target.split('?').next().unwrap_or("").chars().take(200).collect();
+            log(&format!("path not allowed: {method} {path}"));
             return Err(reject(403, "path not allowed"));
         }
         if !ct_eq(presented_key(req.headers), self.key.as_bytes()) {

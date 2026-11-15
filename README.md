@@ -28,6 +28,11 @@ The proxy reads the real token once on stdin and keeps it in memory only. The ag
 per-launch key that only works against this proxy instance, on this machine. Run one instance
 per inference service.
 
+It is meant to be used together with [restrict_llm](https://github.com/aurianer/restrict_llm),
+which provides the sandbox (a dedicated user, bubblewrap and seccomp). The
+`claude-via-inference-proxy` launcher in this repo starts the proxy, then Claude Code in that
+sandbox.
+
 ## Recommended: keep the token on a YubiKey with touch enforced
 
 The proxy protects the token while it is in use. Protect it at rest too:
@@ -59,18 +64,21 @@ The proxy protects the token while it is in use. Protect it at rest too:
 
 ## Usage
 
-stdin: line 1 is the local key (at least 32 printable characters), line 2 is the real token.
-Further lines are ignored.
-
 ```bash
-key="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
-coproc PROXY { exec inference-proxy --upstream https://api.example.ch; }
-{ printf '%s\n' "$key"; pass show work/token; } >&"${PROXY[1]}"
-exec {PROXY[1]}>&-
-IFS= read -r port <&"${PROXY[0]}"
-
-ANTHROPIC_BASE_URL="http://127.0.0.1:${port#port=}" ANTHROPIC_AUTH_TOKEN="$key" claude
+claude-via-inference-proxy <upstream-url> <pass-entry> <bearer|x-api-key> [claude args]
 ```
+
+The launcher generates the local key, starts the proxy, lets `pass` write the token straight
+into it, then runs restrict_llm's `/usr/local/bin/claude-sandboxed` with `ANTHROPIC_BASE_URL`
+and `ANTHROPIC_AUTH_TOKEN` set to the proxy address and the local key. Other environment
+variables (`CLAUDE_CONFIG_DIR`, `ANTHROPIC_MODEL`, ...) are passed through to Claude Code.
+
+To drive the proxy from another launcher, use
+[claude-via-inference-proxy](claude-via-inference-proxy) as the reference:
+
+- stdin: line 1 is the local key (at least 32 printable characters), line 2 is the real token.
+  Further lines are ignored.
+- stdout: one line, `port=<n>`, once the proxy is listening.
 
 | Option | Meaning |
 |---|---|
@@ -88,6 +96,7 @@ cargo build --release --locked
 cargo test --locked
 PROXY_BIN=target/release/inference-proxy python3 -m unittest discover -s tests
 sudo install -o root -g root -m 755 target/release/inference-proxy /usr/local/bin/
+sudo install -o root -g root -m 755 claude-via-inference-proxy /usr/local/bin/
 ```
 
 `--locked` builds exactly the versions in `Cargo.lock`, with checksums verified by cargo. Build
